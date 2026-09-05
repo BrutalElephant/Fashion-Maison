@@ -413,4 +413,9 @@ enabled = true
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":80,\"commaStyle\":\"trailing\"}"
 
 [functions.update-fx-rate]
+# Public JWT verification is intentionally off so a scheduler can call this
+# function with only the `x-fx-secret: FX_SCHEDULER_SECRET` header. The
+# function itself rejects every other caller unless an admin session is
+# presented (see supabase/functions/update-fx-rate/index.ts). Set
+# `supabase secrets set FX_SCHEDULER_SECRET=...` before deploying.
 verify_jwt = false
