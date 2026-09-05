@@ -1,94 +1,56 @@
-# Fashion Maison — production backend
+# Fashion Maison — production repository
 
-The existing premium storefront remains intact. `supabase-schema.sql` is the production PostgreSQL/Supabase schema with RLS, indexes, relationships, variant inventory and order/payment records.
+Premium storefront + Supabase backend for Fashion Maison: real auth, admin-owned catalog with public product images, server-authoritative cart/checkout, Paystack **and** manual bank transfer with a private receipt verification queue, pre-orders, bespoke tailoring, FX display, and a PWA shell. The UI design is the production design — this file documents what is implemented and what deployment requires.
 
-## Configure
-1. Create a Supabase project and run `supabase-schema.sql` in SQL Editor.
-2. Create a private `product-images` Storage bucket. Add Storage policies scoped to the merchant's store.
-3. Configure Auth email/phone providers and set the first admin's `profiles.role` to `admin` using a server-side migration.
-4. Deploy server-side Supabase Edge Functions (never browser code) for `create-order`, `initialize-paystack`, `verify-paystack`, and `update-order-status`. These functions must re-read prices/stock, use a transaction/row locks for inventory, and only mark paid after Paystack server verification.
-5. Set secrets in Supabase Edge Functions: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `PAYSTACK_SECRET_KEY`. The Paystack public key may be exposed only in a client environment variable.
+## Layout
+- `index.html`, `app.js`, `style.css`, `cinematic-engine.js`, `supabase-client.js` — static storefront (no build step). `config.js` (gitignored, see `runtime-config.example.js`) supplies `window.FASHION_MAISON_CONFIG = { url, publishableKey }` at deploy time.
+- `supabase/migrations/` — the database is defined **only** by these timestamped files (oldest → newest). The old standalone root `*-migration.sql` files were folded in and removed.
+- `supabase/functions/` — Edge Functions (TypeScript/Deno): `create-order`, `initialize-paystack`, `verify-paystack`, `submit-manual-payment`, `verify-manual-payment`, `payment-receipt-url`, `admin-catalog`, `update-fx-rate`, plus `_shared/fm.ts`.
+- `supabase-schema.sql` — original reference schema; kept for reading, superseded by migrations.
+- `tools/make_icons.py` — regenerates the PWA icons in `assets/icons/`.
 
-## Current audit
-- Frontend: WORKING — existing responsive storefront, detail, search, cart and checkout interaction.
-- Backend: PARTIALLY IMPLEMENTED — schema and RLS are supplied; this static preview has no project URL or credentials.
-- Database: IMPLEMENTED — normalized tables, constraints, indexes, timestamps and RLS SQL.
-- Auth: MISSING IN PREVIEW — wire Supabase Auth UI to the profiles role model.
-- Product management/uploads: PARTIALLY IMPLEMENTED — database/storage contract is defined; needs authenticated merchant screens and Storage client.
-- Inventory/cart/orders: PARTIALLY IMPLEMENTED — schema is ready; trusted Edge Functions are required for atomic checkout.
-- Paystack: ARCHITECTURE READY — requires provider credentials and Edge Functions; no simulated payment is claimed.
-- Pre-orders: IMPLEMENTED IN MODEL — `product_status`, expected date, order status and `preorders` table.
-- Merchant dashboard: PARTIALLY IMPLEMENTED — overview is present; CRUD/API wiring remains credential-dependent.
-- Customer account: PARTIALLY IMPLEMENTED — route placeholder remains; auth/order-history wiring required.
-- Security/RLS: IMPLEMENTED BASELINE — policies included; Storage policies and admin policies should be added before launch.
-- PWA: WORKING — manifest and service-worker shell caching.
-- Deployment: READY FOR CONFIGURATION — serve over HTTPS, configure Supabase secrets, Storage policies, email templates and Edge Functions.
+## Deploy order
+1. `supabase link` then `supabase db push` (or run each migration file in the SQL Editor in order).
+2. Migrations create the Storage buckets for real: `product-images` (public read, admin write, 8MB, JPEG/PNG/WebP), `payment-receipts` (private, 10MB, JPEG/PNG/WebP/PDF, owner+admin read), `private-tailoring` (private, per-customer prefixes). Nothing else to click.
+3. Secrets (Edge Functions): `supabase secrets set SUPABASE_URL=… SUPABASE_ANON_KEY=…(or SUPABASE_PUBLISHABLE_KEY) SUPABASE_SERVICE_ROLE_KEY=… CURRENCYAPI_KEY=… PAYSTACK_SECRET_KEY=… FX_SCHEDULER_SECRET=… FX_FALLBACK_WINDOW_HOURS=24`.
+4. Deploy functions: `supabase functions deploy` (all nine).
+5. Promote the first admin **server-side** (SQL Editor or migration): `update profiles set role='admin' where id='<uuid>';` — the REST layer can no longer write `profiles.role` at all (column grants revoked for `anon`/`authenticated`, trigger `protect_profile_role` blocks role writes, `admin_set_user_role` RPC is service-role-only and audited). Afterwards the dashboard's Customers tab can change roles.
+6. Admin dashboard → Payment settings: enter the real bank coordinates; enable/disable Paystack vs manual transfer; reservation window.
 
-## Dual-currency pricing
+## Security model (implemented, not aspirational)
+- **Prices/totals/stock/payment status are never taken from the browser.** `create-order` validates the session, then calls the `SECURITY DEFINER` RPC `create_order_atomically` (service-role-only grant): it re-reads `products.base_price/variant.price`, `SELECT … FOR UPDATE` on inventory in deterministic order, refuses drift (`PRICE_CHANGED`, `STOCK_CHANGED`, `PRODUCT_UNAVAILABLE`), applies `delivery_methods` fees, snapshots `current_usd_ngn_rate` onto order and line items, reserves stock with an expiry (`reservation_expires_at`, `release_expired_reservations` janitor), records pre-order lines without reservation, and is idempotent per `(customer_id, idempotency_key)`.
+- **Payments.** Paystack is charged in NGN from `orders.total` server-side; `verify-paystack` re-verifies reference/status/currency/amount against the provider API before `finalize_successful_payment` flips payment→successful, order→paid (or pre-order), converts reservations to sold, and recomputes product stock status. Missing `PAYSTACK_SECRET_KEY` returns a truthful 503 `PAYMENT_CONFIG_MISSING` — success is never simulated.
+- **Manual bank transfer (complete flow).** Checkout → platform `payment_settings` (real bank coordinates, admin-maintained) → customer transfers → uploads receipt to the **private** `payment-receipts` bucket under `receipts/<user_id>/<order_id>/` → `submit-manual-payment` verifies the object exists and the path belongs to the caller, records the authoritative `orders.total`, moves the order to `pending_manual_verification` and notifies admins → **admin queue** (dashboard → Manual payments) shows reference, order, customer, amount and a 60-second signed receipt view (`payment-receipt-url`, owner-or-admin only) → **Approve** requires a bank transaction reference (reuses the authoritative finalization path → `paid`, stock sold) / **Reject** requires a reason (order back to `pending`, reservation released, customer notified). All decisions are written to `audit_logs`.
+- **RLS.** Customers see only their own profile/cart/orders/addresses/notifications/measurements/receipts; storefront reads are limited to published products (+ their images/variants/categories, approved stores); admins manage catalog, orders, payments, settings, users; `is_admin()` is the SECURITY DEFINER gate; service-role key exists only in Edge Function secrets. Product images of published products are readable through `product_images` RLS *and* the public bucket.
+- **Carts.** `carts`/`cart_items` are the real persistence layer when signed in (variant-aware, `unique (cart_id, product_id, variant_id) nulls not distinct`); localStorage is a fallback for anonymous/abandoned sessions and is merged into the server cart on sign-in.
+- **FX.** CurrencyAPI is called only by `update-fx-rate`, which requires the scheduler secret header or an admin session, rejects >35% unforced drift, and inserts immutable `exchange_rates` rows. The browser reads the `current_usd_ngn_rate` view for display only; the trusted RPC snapshots it per order. No key reaches the client.
+- **Tailoring.** `measurement_profiles` + `custom_order_options` exist per the hardening migration; reference photos go to `private-tailoring/<user_id>/…` (owner + admin only). Checkout attaches a measurement profile into `orders.tailoring_snapshot` and `custom_order_options`; one customer can never read another's files.
 
-NGN remains the authoritative product price. The storefront now renders a secondary USD equivalent through the shared `fx()` engine when a server-provided rate is available (`window.FM_FX_RATE` or the temporary `fm-fx-rate` cache). Without a validated rate it correctly shows `USD price temporarily unavailable` and never invents a value. Add an authenticated Supabase read for the latest `exchange_rates` row in the production client, and have an hourly Edge Function populate that table from the approved provider. Add `base_currency`, `base_price`, and order-item FX snapshot columns in the next migration before checkout is enabled:
+## Storefront routes
+`#/` home · `#/shop` catalog · `#/product/<id>` · `#/cart` · `#/checkout` (sign-in required when connected) · `#/checkout/return?reference=…` (Paystack verification) · `#/pay/<order_id>` resume payment · `#/account` orders/profile/measurements · `#/admin` dashboard (admin role required) · `#/merchant` store program info.
 
-```sql
-alter table products add column if not exists base_currency char(3) not null default 'NGN';
-alter table products add column if not exists base_price numeric(12,2);
-alter table order_items add column if not exists unit_price_ngn numeric(12,2);
-alter table order_items add column if not exists fx_rate_snapshot numeric(20,8);
-alter table order_items add column if not exists usd_equivalent_snapshot numeric(12,2);
-```
+## Image pipeline (blank-image fixes)
+Admin uploads via dashboard → storage object `product-images/products/<product_id>/<file>` (admin-only insert policy) → `product_images.storage_path` row (path validated by `admin-catalog`) → storefront renders `…/storage/v1/object/public/product-images/products/…` through `hydrateImages()`, which probes the URL first and paints an on-brand placeholder on miss (never a broken/blank tile). Legacy absolute URLs stored in `storage_path` keep working. To re-verify on the live project: load the White Louis Vuitton Sneakers product page and confirm the hero/storage image renders from the public URL.
 
-FX audit: **FX database READY**, **USD conversion READY**, **product/cart display READY**, **provider and automatic refresh BLOCKED until provider credentials and Edge Function are deployed**, **order snapshot BLOCKED until migration and trusted checkout function are deployed**, **security READY at schema baseline**. No FX rate is hard-coded as a live value.
+## Scheduler
+Hourly FX refresh and reservation cleanup (from pg_cron or any scheduler that can send headers):
+`curl -X POST $URL/functions/v1/update-fx-rate -H "x-fx-secret: $FX_SCHEDULER_SECRET"` and, periodically, admin dashboard → “Release expired reservations” (or a scheduled `admin-catalog {"operation":"release_reservations"}` call).
 
-## currencyapi FX deployment
+## Validation performed (2026-09-05)
+`node --check` passes for `app.js`, `supabase-client.js`, `cinematic-engine.js`; every Edge Function passes `node --check` and a `tsc --noEmit` pass against real `@supabase/supabase-js@2` types; a scripted DOM harness exercised login → variant cart → create-order → manual receipt → review queue → Paystack redirect/return against a mocked backend. Migrations target PostgreSQL 15+/17 Supabase projects and are written to be non-destructive and idempotent; they were authored for a live project whose API was not reachable from this workspace, so run `supabase db push` against it and then the checks in “Deploy order”.
 
-`supabase/functions/update-fx-rate/index.ts` is the server-only updater. It calls currencyapi for USD to NGN, validates the response, inserts an immutable audit row, and never deletes historical rates. The browser never receives `CURRENCYAPI_KEY`.
-
-Setup:
-
-```bash
-supabase secrets set CURRENCYAPI_KEY=your_currencyapi_key
-supabase functions deploy update-fx-rate
-curl -X POST https://YOUR_PROJECT.supabase.co/functions/v1/update-fx-rate
-```
-
-Configure Supabase Cron/pg_cron to invoke the function hourly (or use an external scheduler):
-
-```sql
-select cron.schedule('fashion-maison-fx-hourly','0 * * * *', $$
-  select net.http_post(url := 'https://YOUR_PROJECT.supabase.co/functions/v1/update-fx-rate', headers := jsonb_build_object('Authorization','Bearer YOUR_FUNCTION_SECRET'));
-$$);
-```
-
-Use `current_usd_ngn_rate` for storefront reads. The checkout Edge Function must independently query that view/table, calculate the USD snapshot from authoritative NGN totals, and charge Paystack in NGN; browser `window.FM_FX_RATE` is display-only. Configure `FX_FALLBACK_WINDOW_HOURS` for stale-rate policy and show the last successful `effective_at` timestamp when inside that window.
-
-Final FX audit: **FX provider READY**, **Edge Function READY**, **exchange_rates READY**, **hourly refresh BLOCKED until scheduler is configured**, **currencyapi connection BLOCKED until CURRENCYAPI_KEY is set and a successful invocation inserts a row**, **stale handling READY at data-model level**, **trusted checkout FX BLOCKED until the checkout Edge Function is deployed**, **historical snapshot BLOCKED until checkout migration/function is deployed**, **Paystack NGN authority READY by design**.
-
-## Trusted checkout and Paystack
-
-Added Edge Functions:
-- `supabase/functions/create-order/index.ts` — authenticated input validation and server-side RPC boundary.
-- `supabase/functions/initialize-paystack/index.ts` — reads `orders.total` from the database and initializes Paystack in NGN only.
-- `supabase/functions/verify-paystack/index.ts` — server-verifies reference, status, currency and amount before calling the finalization RPC.
-
-Run `checkout-migration.sql` in Supabase. The atomic SQL functions `create_order_atomically` and `finalize_successful_payment` must be deployed as `SECURITY DEFINER` functions with row locks, idempotency, reservation release and immutable snapshots as documented in that migration. This preview cannot execute them without a connected Supabase project.
-
-Checkout audit: **Edge Function boundaries READY**, **browser manipulation protection READY**, **Paystack NGN authority READY**, **atomic inventory BLOCKED until the SQL RPCs are deployed**, **trusted checkout FX BLOCKED until the RPC reads `current_usd_ngn_rate`**, **historical snapshots BLOCKED until migration/RPC deployment**, **live payments BLOCKED until `PAYSTACK_SECRET_KEY`, Supabase secrets and webhook/verification deployment are configured**.
-
-## Production hardening and catalog model
-
-Added `production-hardening-migration.sql` non-destructively. It extends the shared product model with product types, brands, SKUs, extensible JSON attributes, customization and pre-order controls; adds inventory sold/low-stock tracking; adds private customer `measurement_profiles`, immutable custom-order option snapshots, and server-only `audit_logs`. It also adds RLS for measurement ownership and a private tailoring Storage bucket contract. No separate clothing/shoe/watch tables are introduced.
-
-The existing static preview remains a visual/demo client. The full admin catalog CRUD, authenticated routes, Storage upload UI, measurement UI and production checkout require wiring to deployed Supabase Auth, RLS, Storage and Edge Functions. Do not expose service-role credentials in the browser.
-
-## Honest master audit
-
-FRONTEND: CODE READY. ADMIN AUTH/CATALOG: BLOCKED — no connected Supabase Auth session or admin Edge Function in this static workspace. CLOTHING/NATIVE WEAR/SHOES/WATCHES/ACCESSORIES: SCHEMA READY — use shared products.attributes and product_type; requires migration deployment and admin CRUD. PRODUCT IMAGES/VARIANTS/INVENTORY: SCHEMA/EDGE BOUNDARY READY, DEPLOYMENT REQUIRED. READY-MADE PRE-ORDERS: MODEL READY, checkout RPC deployment required. CUSTOM TAILORING/MEASUREMENT PROFILES/REFERENCE UPLOADS/CUSTOM PRICING: MODEL READY, private Storage policies and trusted custom-order RPC/UI required. CART: DEMO FUNCTIONAL, Supabase persistence pending. TRUSTED CHECKOUT/FX SNAPSHOTS/PAYSTACK: Edge Function code and schema contracts exist, but RPCs/secrets/deployment are required. CUSTOMER ACCOUNT: BLOCKED pending Auth UI. ADMIN DASHBOARD: DEMO OVERVIEW ONLY. RLS: BASELINE READY, must be applied and integration-tested in the project. MOBILE: READY. PERFORMANCE/TESTING: BLOCKED — no npm project or connected integration environment. DEPLOYMENT: BLOCKED until migrations, secrets, Auth, Storage, scheduler and functions are deployed. GITHUB SAFETY: READY.
-
-Required production configuration: `SUPABASE_URL`, `SUPABASE_ANON_KEY`/publishable key, `SUPABASE_SERVICE_ROLE_KEY` (Edge Functions only), `CURRENCYAPI_KEY`, `PAYSTACK_SECRET_KEY`, Storage policies, Auth settings and scheduler. Never commit these values.
-
-## Admin catalog hardening
-
-Added `admin-catalog-migration.sql` with a protected `is_admin()` helper and admin-only policies for products, images, variants, inventory, categories and audit reads. Added `supabase/functions/admin-catalog/index.ts`, which requires an authenticated Supabase user whose database role is `admin`, then delegates catalog operations through RLS. Product image Storage policies are included as deployment SQL comments because bucket creation/policy application is project configuration.
-
-Master audit: ADMIN AUTH **BLOCKED pending deployed Supabase Auth/project verification**; ADMIN ROUTES **CODE BLOCKED in this static client**; PRODUCT CRUD **Edge Function READY, deployment required**; PRODUCT IMAGES/STORAGE **POLICY READY, bucket deployment required**; VARIANTS/INVENTORY **SCHEMA/POLICY READY, deployment required**; WATCHES/SHOES/CLOTHING/NATIVE WEAR **shared model READY**; PRE-ORDERS/CUSTOM PRODUCTS/CUSTOM PRICING **model/architecture READY, trusted UI/RPC required**; NGN/USD **READY in existing engine**; PUBLISH WORKFLOW **function boundary READY, validation RPC required**; SKU VALIDATION **database migration required**; RLS/AUDIT **baseline READY, must be applied and tested**; STOREFRONT DATABASE CONNECTION **BLOCKED by network/project verification**.
-
-This preview deliberately does not pretend that payment or persistence is live without project credentials.
+## Status
+- Frontend / storefront: IMPLEMENTED (design unchanged).
+- Auth & sessions: IMPLEMENTED (email/password via GoTrue REST, refresh-token handling, route guards for account + admin).
+- Product images: IMPLEMENTED (RLS read for published products, public bucket, path→URL rendering, admin upload path, placeholder fallback).
+- Cart: IMPLEMENTED (Supabase `carts`/`cart_items` authoritative when signed in, local fallback + merge).
+- Checkout / inventory: IMPLEMENTED in code (`create_order_atomically`, reservations, idempotency, oversell-safe locks) — pending deployment.
+- Paystack: IMPLEMENTED; live payments require `PAYSTACK_SECRET_KEY` (never faked when absent).
+- Manual bank transfer + admin review queue + private receipts: IMPLEMENTED end-to-end in code; payment settings values must be entered by the admin (no placeholder bank data on purpose).
+- Pre-orders: IMPLEMENTED (pre-order lines skip reservation, `preorders` row with expected availability, order status `pre-order` on payment).
+- Catalog authority: IMPLEMENTED (`products.store_id` nullable = house selection; no synthetic merchants; admin CRUD via `admin-catalog`).
+- Tailoring: IMPLEMENTED (profiles, reference upload, private storage, order snapshot).
+- FX: IMPLEMENTED + hardened (secret server-side, gated updater, snapshots).
+- RLS/Storage: IMPLEMENTED via migrations (no policy left as a comment for the payment/tailoring/catalog paths).
+- PWA: IMPLEMENTED (v3 service worker: shell precache, network-first navigation, Supabase traffic never cached; generated 192/512/maskable icons).
+- Deployment (push migrations, deploy functions, set secrets, promote first admin, enter bank settings): REQUIRES project credentials + network access to the live Supabase project — the one genuinely environment-dependent step.
