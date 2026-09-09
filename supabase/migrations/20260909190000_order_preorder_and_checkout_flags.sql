@@ -1,10 +1,24 @@
 -- Fashion Maison — order / pre-order admin flags and trusted checkout honouring them.
 -- Non-destructive: ADD COLUMN IF NOT EXISTS, backfill from existing status, CREATE OR REPLACE RPC.
 -- Does not drop tables, rows, statuses, or image/storage objects.
+-- Safe to re-run after a partial apply.
+
+create or replace function public.is_admin() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.profiles where id = auth.uid() and role = 'admin')
+$$;
+revoke all on function public.is_admin() from public;
+grant execute on function public.is_admin() to authenticated, anon;
 
 -- ===========================================================================
--- 1) Product purchasing flags (admin-controlled; storefront + RPC read these)
+-- 0) Columns the checkout RPC reads. ADD IF NOT EXISTS only; never drop/rename.
 -- ===========================================================================
+alter table public.products add column if not exists product_type text not null default 'ready_made';
+alter table public.products add column if not exists brand text;
+alter table public.products add column if not exists attributes jsonb not null default '{}';
+alter table public.products add column if not exists pre_order_price numeric(12,2);
+alter table public.products add column if not exists pre_order_closes_at timestamptz;
+alter table public.products add column if not exists base_price numeric(12,2);
 alter table public.products add column if not exists order_enabled boolean not null default true;
 alter table public.products add column if not exists pre_order_enabled boolean not null default false;
 alter table public.products add column if not exists pre_order_notes text;
@@ -19,22 +33,170 @@ do $$ begin
   end if;
 end $$;
 
+alter table public.product_variants add column if not exists active boolean not null default true;
+
+alter table public.orders add column if not exists idempotency_key text;
+alter table public.orders add column if not exists fx_rate_snapshot numeric(20,8);
+alter table public.orders add column if not exists usd_equivalent_snapshot numeric(12,2);
+alter table public.orders add column if not exists fx_source_snapshot text;
+alter table public.orders add column if not exists fx_timestamp_snapshot timestamptz;
+alter table public.orders add column if not exists tailoring_snapshot jsonb;
+alter table public.orders add column if not exists reservation_expires_at timestamptz;
+alter table public.orders add column if not exists delivery_method text;
+alter table public.orders add column if not exists delivery_address jsonb;
+do $$ begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'orders' and column_name = 'store_id' and is_nullable = 'NO'
+  ) then
+    alter table public.orders alter column store_id drop not null;
+  end if;
+end $$;
+create unique index if not exists orders_customer_idempotency
+  on public.orders (customer_id, idempotency_key) where idempotency_key is not null;
+
+alter table public.order_items add column if not exists is_preorder boolean not null default false;
+alter table public.order_items add column if not exists product_name_snapshot text;
+alter table public.order_items add column if not exists variant_snapshot jsonb;
+alter table public.order_items add column if not exists subtotal_ngn numeric(12,2);
+alter table public.order_items add column if not exists fx_rate_snapshot numeric(20,8);
+alter table public.order_items add column if not exists usd_equivalent_snapshot numeric(12,2);
+
 -- Honour existing catalog: PRE-ORDER / made-to-order pieces become pre-order-only;
 -- OUT OF STOCK pieces cannot be ordered unless already flagged as pre-order.
 update public.products
   set pre_order_enabled = true,
       order_enabled = false
-  where (status = 'PRE-ORDER' or product_type in ('pre_order','made_to_order'))
+  where status = 'PRE-ORDER'
+    and pre_order_enabled = false;
+update public.products
+  set pre_order_enabled = true,
+      order_enabled = false
+  where product_type in ('pre_order','made_to_order')
     and pre_order_enabled = false;
 update public.products
   set order_enabled = false
   where status = 'OUT OF STOCK' and pre_order_enabled = false and order_enabled = true;
 
--- Optional alias so older clients selecting payment_instructions still work.
+-- ===========================================================================
+-- 1) payment_settings — use the live instruction column (payment_instructions).
+--    Do NOT add or require manual_instructions. Do not recreate the table.
+-- ===========================================================================
+alter table public.payment_settings add column if not exists store_id uuid;
+alter table public.payment_settings add column if not exists currency char(3) default 'NGN';
+alter table public.payment_settings add column if not exists bank_name text;
+alter table public.payment_settings add column if not exists account_name text;
+alter table public.payment_settings add column if not exists account_number text;
 alter table public.payment_settings add column if not exists payment_instructions text;
-update public.payment_settings
-  set payment_instructions = coalesce(payment_instructions, manual_instructions)
-  where payment_instructions is null and manual_instructions is not null;
+alter table public.payment_settings add column if not exists paystack_enabled boolean not null default true;
+alter table public.payment_settings add column if not exists manual_transfer_enabled boolean not null default true;
+alter table public.payment_settings add column if not exists reservation_minutes int not null default 45;
+
+-- If a legacy instruction column happens to exist, copy into payment_instructions
+-- without adding any new instruction column.
+do $$
+declare
+  src text;
+begin
+  select c.column_name into src
+    from information_schema.columns c
+    where c.table_schema = 'public'
+      and c.table_name = 'payment_settings'
+      and c.column_name in ('instructions','bank_instructions','transfer_instructions','manual_instructions')
+    order by case c.column_name
+      when 'instructions' then 1
+      when 'bank_instructions' then 2
+      when 'transfer_instructions' then 3
+      when 'manual_instructions' then 4
+    end
+    limit 1;
+  if src is not null then
+    execute format(
+      'update public.payment_settings set payment_instructions = coalesce(payment_instructions, %I) where payment_instructions is null and %I is not null',
+      src, src
+    );
+  end if;
+end $$;
+
+-- ===========================================================================
+-- Supporting objects the RPC touches (create if missing; never drop).
+-- ===========================================================================
+create table if not exists public.order_items_tmp (
+  order_key text not null,
+  product_id uuid not null,
+  variant_id uuid,
+  product_name text not null,
+  quantity int not null,
+  unit_price numeric(12,2) not null,
+  line_total numeric(14,2) not null,
+  is_preorder boolean not null default false
+);
+alter table public.order_items_tmp enable row level security;
+revoke all on table public.order_items_tmp from anon, authenticated;
+
+create table if not exists public.delivery_methods (
+  key text primary key,
+  label text not null,
+  fee numeric(12,2) not null default 0 check (fee >= 0),
+  active boolean not null default true,
+  sort_order int not null default 0,
+  updated_at timestamptz not null default now()
+);
+insert into public.delivery_methods (key, label, fee, sort_order) values
+  ('store_pickup', 'Store pickup', 0, 1),
+  ('local_delivery', 'Lagos local delivery', 3000, 2),
+  ('nationwide_delivery', 'Nationwide delivery', 7000, 3)
+on conflict (key) do nothing;
+alter table public.delivery_methods enable row level security;
+drop policy if exists "public can read delivery methods" on public.delivery_methods;
+create policy "public can read delivery methods" on public.delivery_methods
+  for select to anon, authenticated using (active);
+drop policy if exists "admins manage delivery methods" on public.delivery_methods;
+create policy "admins manage delivery methods" on public.delivery_methods
+  for all to authenticated using (public.is_admin()) with check (public.is_admin());
+grant select on public.delivery_methods to anon, authenticated;
+
+create table if not exists public.measurement_profiles (
+  id uuid primary key default gen_random_uuid(),
+  customer_id uuid not null references public.profiles(id) on delete cascade,
+  name text not null,
+  unit text not null check (unit in ('CM','INCHES')),
+  measurements jsonb not null default '{}',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table public.measurement_profiles enable row level security;
+
+create table if not exists public.custom_order_options (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid not null references public.orders(id) on delete cascade,
+  measurement_profile_id uuid references public.measurement_profiles(id) on delete set null,
+  unit text check (unit in ('CM','INCHES')),
+  options jsonb not null default '{}',
+  reference_image_paths jsonb not null default '[]',
+  snapshot jsonb not null default '{}',
+  created_at timestamptz not null default now()
+);
+alter table public.custom_order_options enable row level security;
+
+create table if not exists public.audit_logs (
+  id uuid primary key default gen_random_uuid(),
+  actor_id uuid references public.profiles(id) on delete set null,
+  action text not null,
+  entity_type text not null,
+  entity_id uuid,
+  metadata jsonb not null default '{}',
+  created_at timestamptz not null default now()
+);
+alter table public.audit_logs enable row level security;
+
+create table if not exists public.preorders (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid not null unique references public.orders(id) on delete cascade,
+  expected_availability date,
+  status text not null default 'placed',
+  created_at timestamptz not null default now()
+);
 
 -- ===========================================================================
 -- 2) create_order_atomically — same signature, extra purchase-flag checks,
@@ -220,8 +382,10 @@ begin
   v_total := round(v_subtotal + v_fee, 2);
   if v_total <= 0 then raise exception 'INVALID_TOTAL'; end if;
 
-  select r.rate, r.source, r.effective_at into v_fx_rate, v_fx_source, v_fx_at
-    from current_usd_ngn_rate r limit 1;
+  if to_regclass('public.current_usd_ngn_rate') is not null then
+    execute 'select rate, source, effective_at from public.current_usd_ngn_rate limit 1'
+      into v_fx_rate, v_fx_source, v_fx_at;
+  end if;
 
   loop
     begin
@@ -297,8 +461,15 @@ grant execute on function public.create_order_atomically(uuid, jsonb, text, text
 
 -- ===========================================================================
 -- 3) preorders: customers read their own (via parent order); admins manage.
---    Table previously had no RLS. Enabling it does not drop data.
+--    Enabling RLS does not drop data.
 -- ===========================================================================
+create or replace function public.is_admin() returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.profiles where id = auth.uid() and role = 'admin')
+$$;
+revoke all on function public.is_admin() from public;
+grant execute on function public.is_admin() to authenticated, anon;
+
 alter table public.preorders enable row level security;
 drop policy if exists "users see own preorders" on public.preorders;
 create policy "users see own preorders" on public.preorders for select to authenticated

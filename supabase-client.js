@@ -64,22 +64,24 @@
         bank_name:row.bank_name||'',
         account_name:row.account_name||'',
         account_number:row.account_number||'',
-        payment_instructions:row.payment_instructions||row.manual_instructions||'',
+        payment_instructions:row.payment_instructions||row.instructions||'',
         paystack_enabled:row.paystack_enabled!==false,
         manual_transfer_enabled:row.manual_transfer_enabled!==false,
         currency:row.currency||'NGN'
       });
-      try{
-        const r=await this.rest('/rest/v1/payment_settings?select=bank_name,account_name,account_number,manual_instructions,payment_instructions,paystack_enabled,manual_transfer_enabled,currency&store_id=is.null&limit=1');
-        const row=Array.isArray(r)?r[0]:null;
-        return row?map(row):null;
-      }catch(e){
+      const tries=[
+        '/rest/v1/payment_settings?select=bank_name,account_name,account_number,payment_instructions,paystack_enabled,manual_transfer_enabled,currency&store_id=is.null&limit=1',
+        '/rest/v1/payment_settings?select=bank_name,account_name,account_number,payment_instructions&is_active=eq.true&limit=1',
+        '/rest/v1/payment_settings?select=bank_name,account_name,account_number,payment_instructions&limit=1'
+      ];
+      for(const path of tries){
         try{
-          const r=await this.rest('/rest/v1/payment_settings?select=bank_name,account_name,account_number,manual_instructions,paystack_enabled,manual_transfer_enabled&store_id=is.null&limit=1');
+          const r=await this.rest(path);
           const row=Array.isArray(r)?r[0]:null;
-          return row?map(row):null;
-        }catch(err){return null}
+          if(row)return map(row);
+        }catch(e){}
       }
+      return null;
     },
     storagePublicUrl,
     productImageUrl:storagePublicUrl,
