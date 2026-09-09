@@ -1,6 +1,7 @@
 .env
 .env.local
 .env.*.local
+runtime-config.js
 node_modules/
 .next/
 dist/

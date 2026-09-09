@@ -1,3 +1,3 @@
 <!doctype html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#171513"><link rel="manifest" href="manifest.json"><title>Fashion Maison — Fashion, discovered differently.</title><link rel="stylesheet" href="style.css"></head>
-<body><div id="app"></div><script src="supabase-client.js"></script><script src="app.js"></script></body></html>
+<body><div id="fm-loader" aria-label="Loading Fashion Maison"><div class="fm-loader-mark">FM</div><div class="fm-loader-line"><span></span></div></div><div id="app"></div><script src="runtime-config.js"></script><script src="supabase-client.js"></script><script src="cinematic-engine.js"></script><script src="app.js"></script><script>addEventListener("load",()=>setTimeout(()=>document.body.classList.add("fm-ready"),500));</script></body></html>
