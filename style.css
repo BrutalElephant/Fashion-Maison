@@ -43,3 +43,9 @@ body{background:linear-gradient(115deg,#e5ae22 0%,#f6d044 28%,#d99d12 52%,#f7cf3
 .admin-piece{border-bottom:1px solid var(--line);padding:12px 0 20px}
 .admin-copy{display:grid;gap:8px;padding:8px 0 4px}
 .admin-copy textarea,.field textarea{padding:14px;border:1px solid var(--line);background:#fff;width:100%;min-height:72px;resize:vertical}
+.attr-grid{display:grid;gap:8px;margin:18px 0 8px}
+.attr-row{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);padding:8px 0;font-size:13px}
+.attr-row span{color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-size:10px}
+.order-card{border-bottom:1px solid var(--line);padding:12px 0}
+.order-card .side{margin-top:8px}
+.add:disabled{opacity:.35;cursor:not-allowed}
