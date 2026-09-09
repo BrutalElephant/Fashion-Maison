@@ -33,3 +33,13 @@ body{background:var(--fashion-gold)}
 body{position:relative}body:before{content:'';position:fixed;inset:0;pointer-events:none;z-index:-1;background:radial-gradient(circle at 15% 20%,rgba(255,255,255,.08),transparent 32%),radial-gradient(circle at 82% 72%,rgba(255,255,255,.06),transparent 28%);background-size:140% 140%;animation:fm-gold-drift 24s ease-in-out infinite alternate}@keyframes fm-gold-drift{from{background-position:0% 0%}to{background-position:100% 100%}}@media(prefers-reduced-motion:reduce){body:before{animation:none}}
 /* Live moving Fashion Maison gold field */
 body{background:linear-gradient(115deg,#e5ae22 0%,#f6d044 28%,#d99d12 52%,#f7cf3e 76%,#e1aa1c 100%);background-size:320% 320%;animation:fmGoldFlow 22s ease-in-out infinite alternate}.nav,.section,.cartpanel,.checkout,.admin,.productinfo{background:linear-gradient(120deg,rgba(238,185,38,.98),rgba(255,215,65,.96),rgba(218,157,16,.98));background-size:240% 240%;animation:fmGoldFlow 26s ease-in-out infinite alternate}.hero{background:linear-gradient(120deg,#e2a916,#f7ce3b,#d89b0b);background-size:240% 240%;animation:fmGoldFlow 24s ease-in-out infinite alternate}.banner,.summary,.story-copy{background:linear-gradient(120deg,#f0c43a,#f9dc70,#e5ae22);background-size:240% 240%;animation:fmGoldFlow 28s ease-in-out infinite alternate}@keyframes fmGoldFlow{0%{background-position:0% 50%}50%{background-position:100% 20%}100%{background-position:20% 100%}}@media(prefers-reduced-motion:reduce){body,.nav,.section,.cartpanel,.checkout,.admin,.productinfo,.hero,.banner,.summary,.story-copy{animation:none}}
+
+.fm-admin-thumbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;align-items:center}
+.fm-admin-thumb{width:56px;height:56px;object-fit:cover;border:1px solid var(--line);background:#fff}
+.productcaption{font-size:12px;color:var(--muted);margin-top:5px;line-height:1.45;font-style:italic;max-width:34ch}
+.detail-caption{font:italic 20px Georgia,serif;margin:0 0 16px;color:var(--fashion-gold-dark);line-height:1.4;max-width:28ch}
+.fm-gate{background:var(--ink);color:#fff;padding:14px 16px;margin:0 0 16px;font-size:13px;line-height:1.5}
+.authform{max-width:420px}
+.admin-piece{border-bottom:1px solid var(--line);padding:12px 0 20px}
+.admin-copy{display:grid;gap:8px;padding:8px 0 4px}
+.admin-copy textarea,.field textarea{padding:14px;border:1px solid var(--line);background:#fff;width:100%;min-height:72px;resize:vertical}
