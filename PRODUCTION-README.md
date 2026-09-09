@@ -29,8 +29,14 @@ Premium storefront + Supabase backend for Fashion Maison: real auth, admin-owned
 ## Storefront routes
 `#/` home · `#/shop` catalog · `#/product/<id>` · `#/cart` · `#/checkout` (sign-in required when connected) · `#/checkout/return?reference=…` (Paystack verification) · `#/pay/<order_id>` resume payment · `#/account` orders/profile/measurements · `#/admin` dashboard (admin role required) · `#/merchant` store program info.
 
-## Image pipeline (blank-image fixes)
-Admin uploads via dashboard → storage object `product-images/products/<product_id>/<file>` (admin-only insert policy) → `product_images.storage_path` row (path validated by `admin-catalog`) → storefront renders `…/storage/v1/object/public/product-images/products/…` through `hydrateImages()`, which probes the URL first and paints an on-brand placeholder on miss (never a broken/blank tile). Legacy absolute URLs stored in `storage_path` keep working. To re-verify on the live project: load the White Louis Vuitton Sneakers product page and confirm the hero/storage image renders from the public URL.
+## Image pipeline
+Admin upload → Storage bucket `product-images` (public read, admin write) → `product_images.storage_path` → storefront `FashionMaisonSupabase.storagePublicUrl()` → product card / product page / merchandising tiles.
+
+`storagePublicUrl` builds `/storage/v1/object/public/product-images/<encoded-segments>` (not the Image Transformation `/render/image/` URL, and not `encodeURIComponent` of the whole path — that encoded slashes and 404'd nested keys). Absolute URLs already stored in `storage_path` pass through. Spaces and other special characters are encoded per path segment.
+
+Storefront reads require a SELECT policy on `product_images` for published products (RLS is on, and the original schema had no public read policy — that is why product names showed and photos did not). Apply `product-images-storefront-migration.sql` (also `supabase/migrations/20260909163000_product_images_storefront_read.sql`) in the SQL Editor if it has not been applied.
+
+Admin → Product images uploads to `products/<product_id>/<timestamp>-<file>` and inserts the `product_images` row. Future products use the same generic path; nothing is hard-coded to a single shoe.
 
 ## Scheduler
 Hourly FX refresh and reservation cleanup (from pg_cron or any scheduler that can send headers):

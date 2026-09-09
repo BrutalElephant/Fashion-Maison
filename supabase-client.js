@@ -1,272 +1,77 @@
-// Fashion Maison — thin Supabase client (no build step, browser-safe key only).
-// Real auth: session persistence, token refresh, sign out. Storage helpers for
-// product images (public), payment receipts and private tailoring references.
-// The service-role key NEVER appears here; privileged operations live in the
-// Edge Functions under supabase/functions/.
-(function () {
-  "use strict";
+/* Safe static-deployment bridge. Inject window.FASHION_MAISON_CONFIG at deploy time; never include service keys. */
+(function(){
+  const c=window.FASHION_MAISON_CONFIG||{};
+  const url=c.url||''; const key=c.publishableKey||''; let accessToken=sessionStorage.getItem('fm-access-token')||key;
+  const headers=()=>({'apikey':key,'Authorization':`Bearer ${accessToken||key}`,'Content-Type':'application/json'});
 
-  const config = window.FASHION_MAISON_CONFIG || {};
-
-  const url = String(config.url || "https://utvavxwbsutxuxhausaw.supabase.co").replace(/\/+$/, "");
-  const key = config.publishableKey || config.anonKey || "";
-
-  const ACCESS = "fm-access-token";
-  const REFRESH = "fm-refresh-token";
-
-  const ls = {
-    get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
-    set(k, v) { try { if (v) localStorage.setItem(k, v); else localStorage.removeItem(k); } catch {} },
-  };
-
-  const accessToken = () => ls.get(ACCESS);
-  const refreshToken = () => ls.get(REFRESH);
-
-  function setSession(s) {
-    if (!s) return;
-    if (s.access_token) ls.set(ACCESS, s.access_token);
-    if (s.refresh_token) ls.set(REFRESH, s.refresh_token);
-  }
-
-  function clearSession() {
-    ls.set(ACCESS, "");
-    ls.set(REFRESH, "");
-  }
-
-  function jwtClaims(token) {
-    try {
-      const part = String(token || accessToken()).split(".")[1];
-      if (!part) return {};
-      const pad = part.replace(/-/g, "+").replace(/_/g, "/");
-      return JSON.parse(atob(pad + "=".repeat((4 - (pad.length % 4)) % 4)));
-    } catch {
-      return {};
+  function encodeObjectPath(path){
+    let p=String(path||'').replace(/^\/+|\/+$/g,'');
+    if(p&&p.indexOf('/')===-1&&/%2f/i.test(p)){
+      try{p=decodeURIComponent(p)}catch(e){}
     }
+    return p.split('/').map(seg=>{
+      let decoded=seg;
+      try{decoded=decodeURIComponent(seg)}catch(e){decoded=seg}
+      return encodeURIComponent(decoded);
+    }).join('/');
   }
 
-  function tokenExpiryMs() {
-    const c = jwtClaims();
-    return c && c.exp ? c.exp * 1000 : 0;
-  }
-
-  let refreshing = null;
-  async function refreshNow() {
-    const rt = refreshToken();
-    if (!rt) return false;
-    if (!refreshing) {
-      refreshing = (async () => {
-        try {
-          const res = await fetch(url + "/auth/v1/token?grant_type=refresh_token", {
-            method: "POST",
-            headers: { apikey: key, "Content-Type": "application/json" },
-            body: JSON.stringify({ refresh_token: rt }),
-          });
-          if (!res.ok) { clearSession(); return false; }
-          const data = await res.json();
-          setSession(data);
-          return true;
-        } catch {
-          return false;
-        } finally {
-          refreshing = null;
-        }
-      })();
-    }
-    return refreshing;
-  }
-
-  async function ensureFresh() {
-    if (!accessToken()) return;
-    const exp = tokenExpiryMs();
-    // Refresh proactively a minute before expiry (or if already stale).
-    if (!exp || exp - Date.now() > 60000) return;
-    if (refreshToken()) await refreshNow();
-  }
-
-  function headers(extra) {
-    const h = { apikey: key, "Content-Type": "application/json" };
-    const t = accessToken();
-    if (t) h.Authorization = "Bearer " + t;
-    return { ...h, ...(extra || {}) };
-  }
-
-  async function rawFetch(path, options) {
-    return fetch(url + path, { ...options, headers: headers(options && options.headers) });
-  }
-
-  async function request(path, options = {}) {
-    if (!key) throw new Error("Supabase publishable key is not configured.");
-    await ensureFresh();
-    let response = await rawFetch(path, options);
-    // One refresh-and-retry on 401 keeps long-lived tabs signed in.
-    if (response.status === 401 && refreshToken()) {
-      if (await refreshNow()) response = await rawFetch(path, options);
-    }
-    const text = await response.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-    if (!response.ok) {
-      const message =
-        (data && (data.error_description || data.msg || data.message || data.error)) ||
-        `Supabase request failed (${response.status})`;
-      const err = new Error(message);
-      err.status = response.status;
-      err.payload = data;
-      throw err;
-    }
-    return data;
-  }
-
-  async function signUp(email, password, fullName) {
-    const result = await request("/auth/v1/signup", {
-      method: "POST",
-      body: JSON.stringify({
-        email,
-        password,
-        data: { full_name: fullName || "" },
-        options: { data: { full_name: fullName || "" } },
-      }),
-    });
-    if (result && (result.access_token || result.refresh_token)) setSession(result);
-    return result;
-  }
-
-  async function signIn(email, password) {
-    const result = await request("/auth/v1/token?grant_type=password", {
-      method: "POST",
-      body: JSON.stringify({ email, password }),
-    });
-    setSession(result);
-    return result;
-  }
-
-  async function signOut() {
-    try {
-      if (accessToken()) await fetch(url + "/auth/v1/logout", { method: "POST", headers: headers() });
-    } catch { /* best-effort server-side sign out */ }
-    clearSession();
-  }
-
-  async function getUser() {
-    if (!accessToken()) return null;
-    await ensureFresh();
-    try {
-      const user = await request("/auth/v1/user");
-      return user && user.id ? user : null;
-    } catch {
-      clearSession();
-      return null;
-    }
-  }
-
-  async function getProfile(userId) {
-    const rows = await request(
-      `/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}&select=*`
-    );
-    return Array.isArray(rows) ? rows[0] || null : null;
-  }
-
-  /** HEAD-style count via Range + Prefer headers. */
-  async function count(path) {
-    await ensureFresh();
-    const res = await rawFetch(path + (path.includes("?") ? "&" : "?") + "select=id", {
-      method: "GET",
-      headers: { Prefer: "count=exact", Range: "0-0", RangeUnit: "items" },
-    });
-    const range = res.headers.get("content-range");
-    if (!range || !res.ok) return null;
-    const total = range.split("/")[1];
-    return total === "*" ? null : parseInt(total, 10);
-  }
-
-  /** Direct storage upload (up to 10 MB receipts / 8 MB images — bucket limits apply). */
-  async function upload(bucket, path, file) {
-    if (!key) throw new Error("Supabase publishable key is not configured.");
-    await ensureFresh();
-    const res = await fetch(
-      `${url}/storage/v1/object/${bucket}/${path.split("/").map(encodeURIComponent).join("/")}`,
-      {
-        method: "PUT",
-        headers: {
-          apikey: key,
-          Authorization: accessToken() ? "Bearer " + accessToken() : undefined,
-          "Content-Type": (file && file.type) || "application/octet-stream",
-          "x-upsert": "false",
-        },
-        body: file,
+  // Build a publicly fetchable URL for a product image stored in the product-images bucket.
+  // Accepts: absolute URLs, bucket-prefixed paths, object/render URLs, and raw storage_path values
+  // (including spaces / unicode). Does not use Image Transformations — those are not required
+  // and were encoding slashes, which made nested keys such as products/<id>/file.jpg 404.
+  function storagePublicUrl(path){
+    if(!url||path==null||path==='')return '';
+    let raw=String(path).trim();
+    if(!raw)return '';
+    if(/^https?:\/\//i.test(raw)){
+      const stored=raw.match(/^https?:\/\/[^/?#]+\/storage\/v1\/(?:render\/image|object)\/public\/([^/?#]+)\/([^?#]+)/i);
+      if(stored){
+        const bucket=(()=>{try{return decodeURIComponent(stored[1])}catch(e){return stored[1]}})();
+        let objectPath=stored[2];
+        try{objectPath=decodeURIComponent(objectPath)}catch(e){}
+        return `${url}/storage/v1/object/public/${encodeURIComponent(bucket)}/${encodeObjectPath(objectPath)}`;
       }
-    );
-    if (!res.ok) {
-      let msg = `Upload failed (${res.status})`;
-      try { const j = await res.json(); msg = j.message || j.error || msg; } catch {}
-      const err = new Error(msg);
-      err.status = res.status;
-      throw err;
+      return raw;
     }
-    return { bucket, path };
-  }
-
-  function storagePublicPath(bucket, path) {
-    let p = String(path || "").trim();
-    if (!p) return "";
-    if (/^https?:\/\//i.test(p)) return p;
-    p = p.replace(/^\/+/, "");
-    if (p.startsWith(bucket + "/")) p = p.slice(bucket.length + 1);
-    if (p.startsWith("public/")) p = p.slice(7);
-    return `${url}/storage/v1/object/public/${bucket}/${p.split("/").map(encodeURIComponent).join("/")}`;
-  }
-
-  const productImageUrl = (path) => storagePublicPath("product-images", path);
-
-  async function callFunction(name, body) {
-    if (!key) throw new Error("Supabase publishable key is not configured.");
-    await ensureFresh();
-    const res = await fetch(`${url}/functions/v1/${name}`, {
-      method: "POST",
-      headers: {
-        apikey: key,
-        "Content-Type": "application/json",
-        ...(accessToken() ? { Authorization: "Bearer " + accessToken() } : {}),
-      },
-      body: JSON.stringify(body || {}),
-    });
-    const text = await res.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
-    if (!res.ok) {
-      const err = new Error((data && (data.message || data.error)) || `Function ${name} failed (${res.status})`);
-      err.status = res.status;
-      err.code = (data && data.code) || "FUNCTION_FAILED";
-      err.payload = data;
-      throw err;
+    raw=raw.replace(/^\/+/, '');
+    raw=raw.replace(/^storage\/v1\/(?:object|render\/image)\/public\//,'');
+    let bucket='product-images';
+    const known=/^(product-images|product_images)\//i;
+    if(known.test(raw)){
+      const slash=raw.indexOf('/');
+      bucket=raw.slice(0,slash)==='product_images'?'product-images':raw.slice(0,slash);
+      raw=raw.slice(slash+1);
     }
-    if (!data) throw new Error(`Function ${name} returned no data.`);
-    return data;
+    if(raw.startsWith('public/')) raw=raw.slice(7);
+    if(!raw)return '';
+    return `${url}/storage/v1/object/public/${encodeURIComponent(bucket)}/${encodeObjectPath(raw)}`;
   }
 
-  window.FashionMaisonSupabase = {
-    url,
-    key,
-    configured: Boolean(key),
-    request,
-    rest: (path, options) => request(path, options),
-    count,
-    signUp,
-    signIn,
-    signOut,
-    getUser,
-    getProfile,
-    setSession,
-    clearSession,
-    accessToken: () => { ensureFresh(); return accessToken(); },
-    upload,
-    storagePublicPath,
-    productImageUrl,
-    callFunction,
+  window.FashionMaisonSupabase={configured:Boolean(url&&key),url,key,
+    setSession(t){accessToken=t||key},
+    async rest(path,opts={}){if(!url||!key) return null; const r=await fetch(url+path,{...opts,headers:{...headers(),...(opts.headers||{})}}); if(!r.ok) throw new Error(`Supabase request failed (${r.status})`); return r.status===204?null:r.json()},
+    async signIn(email,password){const r=await this.rest('/auth/v1/token?grant_type=password',{method:'POST',body:JSON.stringify({email,password})});accessToken=r.access_token||key;sessionStorage.setItem('fm-access-token',accessToken);window.dispatchEvent(new CustomEvent('fm-auth-change',{detail:r}));return r},
+    async signUp(email,password,full_name){return this.rest('/auth/v1/signup',{method:'POST',body:JSON.stringify({email,password,data:{full_name}})})},
+    async signOut(){accessToken=key;sessionStorage.removeItem('fm-access-token');return this.rest('/auth/v1/logout',{method:'POST'})},
+    async getUser(){return this.rest('/auth/v1/user')},
+    async getProfile(id){const rows=await this.rest(`/rest/v1/profiles?select=*&id=eq.${encodeURIComponent(id)}&limit=1`);return rows?.[0]||null},
+    async invoke(name,body){return this.rest(`/functions/v1/${name}`,{method:'POST',body:JSON.stringify(body)})},
+    async homepageMerchandising(){return this.rest('/rest/v1/homepage_merchandising?select=*&enabled=eq.true&order=sort_order.asc')},
+    async paymentSettings(){const r=await this.rest('/rest/v1/payment_settings?select=bank_name,account_name,account_number,payment_instructions&is_active=eq.true&limit=1');return r?.[0]||null},
+    storagePublicUrl,
+    productImageUrl:storagePublicUrl,
+    async uploadProductImage(path,file){
+      if(!url||!key)throw new Error('Supabase is not configured');
+      const objectPath=encodeObjectPath(String(path||'').replace(/^\/+/,''));
+      const r=await fetch(`${url}/storage/v1/object/product-images/${objectPath}`,{method:'POST',headers:{apikey:key,Authorization:`Bearer ${accessToken||key}`,'Content-Type':file.type||'application/octet-stream','x-upsert':'true'},body:file});
+      if(!r.ok){let msg='Image upload failed';try{const j=await r.json();msg=j.message||j.error||msg}catch(e){}throw new Error(msg)}
+      try{return await r.json()}catch(e){return {path}}
+    },
+    async uploadPaymentReceipt(path,file){if(!this.url||!this.key)throw new Error('Supabase is not configured');const r=await fetch(`${this.url}/storage/v1/object/payment-receipts/${path}`,{method:'POST',headers:{...headers(),'Content-Type':file.type,'x-upsert':'false'},body:file});if(!r.ok)throw new Error('Receipt upload failed');return r.json()},
+    async submitManualPayment(payload){return this.invoke('submit-manual-payment',payload)},
+    async verifyManualPayment(payload){return this.invoke('verify-manual-payment',payload)},
+    async saveMerchandising(record){return this.invoke('admin-catalog',{table:'homepage_merchandising',operation:'upsert',record})},
+    onAuthChange(callback){window.addEventListener('fm-auth-change',e=>callback(e.detail));return()=>window.removeEventListener('fm-auth-change',callback)}
   };
-
-  // Cross-tab session sync: if one tab signs out, others stop using stale tokens.
-  window.addEventListener("storage", (e) => {
-    if (e.key === ACCESS && !e.newValue) window.dispatchEvent(new CustomEvent("fm:signed-out"));
-  });
 })();
