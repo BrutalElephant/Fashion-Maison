@@ -11,7 +11,8 @@ const TABLES: Record<string, { columns: string[] }> = {
   products: {
     columns: ["name", "description", "price", "base_currency", "base_price", "status", "expected_availability",
       "published", "category_id", "store_id", "product_type", "brand", "sku", "attributes", "customizable",
-      "pre_order_price", "pre_order_closes_at"],
+      "pre_order_price", "pre_order_closes_at", "order_enabled", "pre_order_enabled", "pre_order_notes",
+      "pre_order_max_qty"],
   },
   product_images: { columns: ["product_id", "storage_path", "sort_order"] },
   product_variants: { columns: ["product_id", "size", "color", "sku", "price", "active"] },
@@ -19,7 +20,7 @@ const TABLES: Record<string, { columns: string[] }> = {
   categories: { columns: ["store_id", "name"] },
   payment_settings: {
     columns: ["store_id", "currency", "bank_name", "account_name", "account_number", "manual_instructions",
-      "paystack_enabled", "manual_transfer_enabled", "reservation_minutes"],
+      "payment_instructions", "paystack_enabled", "manual_transfer_enabled", "reservation_minutes"],
   },
   delivery_methods: { columns: ["key", "label", "fee", "active", "sort_order"] },
   orders: { columns: ["status"] },

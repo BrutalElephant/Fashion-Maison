@@ -34,6 +34,7 @@ Deno.serve(async (req) => {
       variant_id: typeof x.variant_id === "string" && /^[0-9a-f-]{36}$/i.test(x.variant_id) ? x.variant_id : null,
       quantity: x.quantity,
       expected_unit_price: Number.isFinite(Number(x.expected_unit_price)) ? Number(x.expected_unit_price) : null,
+      is_preorder: x.is_preorder === true,
     }));
 
     const cleanAddress = address && typeof address === "object" ? {

@@ -2,11 +2,9 @@
 .env.local
 .env.*.local
 runtime-config.js
+config.js
 node_modules/
 .next/
 dist/
 build/
 .DS_Store
-
-config.js
-config.js
